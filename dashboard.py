@@ -31,7 +31,6 @@ PLAID_ENV = plaid.Environment.Sandbox
 # 2. CONNECT TO DATA SOURCES
 # ============================================================
 
-# A. Connect to Plaid
 @st.cache_resource
 def get_plaid_client():
     configuration = plaid.Configuration(
@@ -41,21 +40,18 @@ def get_plaid_client():
     api_client = plaid.ApiClient(configuration)
     return plaid_api.PlaidApi(api_client)
 
-# B. Connect to Google Sheets
-@st.cache_data(ttl=60) # Refreshes every 60 seconds
+@st.cache_data(ttl=60)
 def get_google_sheet_data():
     try:
-        # Check if we are on Cloud or Local
         if "gcp_service_account" in st.secrets:
             creds_dict = dict(st.secrets["gcp_service_account"])
-            # Fix private key newline issue
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             
             scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             
-            # OPEN THE SHEET (Make sure the name matches EXACTLY)
+            # OPEN THE SHEET (Ensure your Google Sheet is named exactly this)
             sheet = client.open("Clinic Expenses").sheet1
             data = sheet.get_all_records()
             return pd.DataFrame(data)
@@ -92,7 +88,8 @@ def main():
                 "Amount": t['amount'],
                 "Category": clean_expense_category(t['name']),
                 "Source": "Bank Feed (Plaid)",
-                "Flow": "OUT (Expense)"
+                "Flow": "OUT (Expense)",
+                "Receipt": None  # No receipts for bank yet
             })
     except:
         st.error("Plaid Error. Check Secrets.")
@@ -102,23 +99,26 @@ def main():
     sheet_data = []
     if not sheet_df.empty:
         for index, row in sheet_df.iterrows():
-            # Convert string date to object
             try:
                 d = pd.to_datetime(row['Date']).date()
             except:
                 d = datetime.now().date()
             
+            # SAFE GET: Checks if 'receipts' column exists, otherwise is None
+            receipt_link = row.get('receipts', None) 
+            if receipt_link == "": receipt_link = None
+
             sheet_data.append({
                 "Date": d,
                 "Description": row['Description'],
                 "Amount": float(row['Amount']),
                 "Category": row['Category'],
                 "Source": "Google Sheet",
-                "Flow": "OUT (Expense)"
+                "Flow": "OUT (Expense)",
+                "Receipt": receipt_link
             })
 
     # --- 3. GENERATE REVENUE (Simulator) ---
-    # (Keeping this to show profit)
     rev_data = []
     services = [
         {"Item": "NCS Tech Fee", "Amount": 75.00, "Type": "EMG Tech Svc"},
@@ -132,7 +132,8 @@ def main():
             "Amount": sale["Amount"],
             "Category": sale["Type"],
             "Source": "Simulator",
-            "Flow": "IN (Revenue)"
+            "Flow": "IN (Revenue)",
+            "Receipt": None
         })
 
     # --- MERGE EVERYTHING ---
@@ -140,13 +141,17 @@ def main():
     df_sheet = pd.DataFrame(sheet_data)
     df_rev = pd.DataFrame(rev_data)
     
-    df_all = pd.concat([df_plaid, df_sheet, df_rev]).reset_index(drop=True)
-    df_all['Date'] = pd.to_datetime(df_all['Date'])
-    df_all = df_all.sort_values(by="Date", ascending=False)
+    # Check if empty before concat
+    dfs_to_merge = [df for df in [df_plaid, df_sheet, df_rev] if not df.empty]
+    if dfs_to_merge:
+        df_all = pd.concat(dfs_to_merge).reset_index(drop=True)
+        df_all['Date'] = pd.to_datetime(df_all['Date'])
+        df_all = df_all.sort_values(by="Date", ascending=False)
+    else:
+        st.stop() # Stop if no data
 
     # --- DISPLAY ---
     
-    # Calculate Totals
     total_rev = df_all[df_all['Flow'] == 'IN (Revenue)']['Amount'].sum()
     total_exp = df_all[df_all['Flow'] == 'OUT (Expense)']['Amount'].sum()
     net = total_rev - total_exp
@@ -157,12 +162,17 @@ def main():
     col3.metric("Net Profit", f"${net:,.2f}")
 
     st.subheader("📋 Consolidated Ledger")
-    st.info("This table merges your Bank Feed (Plaid) with your Manual Sheet.")
+    st.info("Transactions from Plaid, Simulator, and Google Sheets.")
     
     st.dataframe(
-        df_all[['Date', 'Description', 'Amount', 'Category', 'Source', 'Flow']],
+        df_all[['Date', 'Description', 'Amount', 'Category', 'Source', 'Flow', 'Receipt']],
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config={
+            "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+            "Receipt": st.column_config.LinkColumn("Receipt", display_text="View Receipt")
+        }
     )
 
 if __name__ == "__main__":
