@@ -6,24 +6,34 @@ from plaid.model.transactions_sync_request import TransactionsSyncRequest
 import random
 from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # ============================================================
-# 1. SECURE CONFIGURATION
+# 1. SMART CONFIGURATION
 # ============================================================
-# Load the keys from the .env file
-load_dotenv()
+def get_key(name):
+    if name in st.secrets: return st.secrets[name]
+    return os.getenv(name)
 
-PLAID_CLIENT_ID = os.getenv('PLAID_CLIENT_ID')
-PLAID_SECRET = os.getenv('PLAID_SECRET')
-ACCESS_TOKEN = os.getenv('PLAID_ACCESS_TOKEN')
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except:
+    pass
 
-PLAID_ENV = plaid.Environment.Sandbox 
+PLAID_CLIENT_ID = get_key('PLAID_CLIENT_ID')
+PLAID_SECRET = get_key('PLAID_SECRET')
+ACCESS_TOKEN = get_key('PLAID_ACCESS_TOKEN')
+PLAID_ENV = plaid.Environment.Sandbox
+
+# ============================================================
+# 2. CONNECT TO DATA SOURCES
 # ============================================================
 
-# 2. Connect to Plaid
+# A. Connect to Plaid
 @st.cache_resource
-def get_client():
+def get_plaid_client():
     configuration = plaid.Configuration(
         host=PLAID_ENV,
         api_key={'clientId': PLAID_CLIENT_ID, 'secret': PLAID_SECRET}
@@ -31,137 +41,127 @@ def get_client():
     api_client = plaid.ApiClient(configuration)
     return plaid_api.PlaidApi(api_client)
 
-# 3. SIMULATOR: Generate "EMG Tech" & Clinic Revenue
-def generate_clinic_revenue(num_transactions=30):
-    data = []
-    services = [
-        # YOUR WORK
-        {"Item": "NCS Tech Fee (Upper Limb)", "Amount": 75.00, "Type": "EMG Tech Svc"},
-        {"Item": "NCS Tech Fee (Lower Limb)", "Amount": 90.00, "Type": "EMG Tech Svc"},
-        {"Item": "Bilateral Carpal Tunnel Study", "Amount": 110.00, "Type": "EMG Tech Svc"},
-        
-        # PASSIVE INCOME
-        {"Item": "Facility Fee Split (Dr. Smith)", "Amount": 150.00, "Type": "Facility Split"},
-        {"Item": "Facility Fee Split (Dr. Patel)", "Amount": 200.00, "Type": "Facility Split"},
-        
-        # RETAIL SALES
-        {"Item": "Wrist Splint (Retail)", "Amount": 45.00, "Type": "Retail Product"},
-        {"Item": "TENS Unit", "Amount": 120.00, "Type": "Retail Product"},
-        {"Item": "Lumbar Roll", "Amount": 30.00, "Type": "Retail Product"},
-    ]
-    
-    today = datetime.now()
-    
-    for _ in range(num_transactions):
-        sale = random.choice(services)
-        days_ago = random.randint(0, 30)
-        date = today - timedelta(days=days_ago)
-        
-        data.append({
-            "Date": date.date(),
-            "Description": sale["Item"],
-            "Amount": sale["Amount"],
-            "Category": sale["Type"],
-            "Flow": "IN (Revenue)"
-        })
-    return pd.DataFrame(data)
+# B. Connect to Google Sheets
+@st.cache_data(ttl=60) # Refreshes every 60 seconds
+def get_google_sheet_data():
+    try:
+        # Check if we are on Cloud or Local
+        if "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            # Fix private key newline issue
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            
+            # OPEN THE SHEET (Make sure the name matches EXACTLY)
+            sheet = client.open("Clinic Expenses").sheet1
+            data = sheet.get_all_records()
+            return pd.DataFrame(data)
+    except Exception as e:
+        st.warning(f"Google Sheet Error: {e}")
+        return pd.DataFrame()
+    return pd.DataFrame()
 
-# 4. Helper: Clean up Plaid Expenses
+# ============================================================
+# 3. DATA PROCESSING
+# ============================================================
+
 def clean_expense_category(name):
     name = name.lower()
     if 'uber' in name or 'united' in name: return "Travel"
     if 'mcdonald' in name or 'starbucks' in name: return "Meals"
     if 'sparkfun' in name or 'apple' in name: return "Equipment/Supplies"
-    if 'payment' in name: return "Rent/Overhead"
     return "Misc. Expense"
 
-# 5. The Main App
 def main():
     st.set_page_config(page_title="London Physio & EMG", page_icon="🏥", layout="wide")
     st.title("🏥 London Physio & EMG: Owner Dashboard")
-    
-    # --- LOAD DATA ---
-    client = get_client()
-    
-    # A. Fetch Expenses (Real Plaid Sandbox Data)
-    expense_data = []
+
+    # --- 1. GET PLAID DATA (Bank) ---
+    plaid_client = get_plaid_client()
+    plaid_data = []
     try:
         request = TransactionsSyncRequest(access_token=ACCESS_TOKEN)
-        response = client.transactions_sync(request)
-        plaid_tx = response['added']
-        
-        for t in plaid_tx:
-            expense_data.append({
+        response = plaid_client.transactions_sync(request)
+        for t in response['added']:
+            plaid_data.append({
                 "Date": pd.to_datetime(t['date']).date(),
                 "Description": t['name'],
-                "Amount": t['amount'], 
+                "Amount": t['amount'],
                 "Category": clean_expense_category(t['name']),
+                "Source": "Bank Feed (Plaid)",
                 "Flow": "OUT (Expense)"
             })
-    except Exception as e:
-        st.error("Plaid Connection Error. Check your Access Token in .env")
+    except:
+        st.error("Plaid Error. Check Secrets.")
 
-    df_expenses = pd.DataFrame(expense_data)
+    # --- 2. GET GOOGLE SHEET DATA (Manual) ---
+    sheet_df = get_google_sheet_data()
+    sheet_data = []
+    if not sheet_df.empty:
+        for index, row in sheet_df.iterrows():
+            # Convert string date to object
+            try:
+                d = pd.to_datetime(row['Date']).date()
+            except:
+                d = datetime.now().date()
+            
+            sheet_data.append({
+                "Date": d,
+                "Description": row['Description'],
+                "Amount": float(row['Amount']),
+                "Category": row['Category'],
+                "Source": "Google Sheet",
+                "Flow": "OUT (Expense)"
+            })
 
-    # B. Generate Revenue (Simulated EMG Tech Data)
-    df_revenue = generate_clinic_revenue(40) 
+    # --- 3. GENERATE REVENUE (Simulator) ---
+    # (Keeping this to show profit)
+    rev_data = []
+    services = [
+        {"Item": "NCS Tech Fee", "Amount": 75.00, "Type": "EMG Tech Svc"},
+        {"Item": "Facility Split", "Amount": 150.00, "Type": "Facility Split"},
+    ]
+    for _ in range(30):
+        sale = random.choice(services)
+        rev_data.append({
+            "Date": (datetime.now() - timedelta(days=random.randint(0,30))).date(),
+            "Description": sale["Item"],
+            "Amount": sale["Amount"],
+            "Category": sale["Type"],
+            "Source": "Simulator",
+            "Flow": "IN (Revenue)"
+        })
 
-    # --- CALCULATE METRICS ---
-    total_revenue = df_revenue['Amount'].sum()
-    total_expense = df_expenses['Amount'].sum() if not df_expenses.empty else 0
-    net_profit = total_revenue - total_expense
+    # --- MERGE EVERYTHING ---
+    df_plaid = pd.DataFrame(plaid_data)
+    df_sheet = pd.DataFrame(sheet_data)
+    df_rev = pd.DataFrame(rev_data)
     
-    profit_margin = (net_profit / total_revenue) * 100 if total_revenue > 0 else 0
+    df_all = pd.concat([df_plaid, df_sheet, df_rev]).reset_index(drop=True)
+    df_all['Date'] = pd.to_datetime(df_all['Date'])
+    df_all = df_all.sort_values(by="Date", ascending=False)
 
-    # --- DISPLAY TOP ROW (KPIs) ---
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Revenue", f"${total_revenue:,.2f}", delta="Income")
-    col2.metric("Total Expenses", f"${total_expense:,.2f}", delta="-Cost", delta_color="inverse")
-    col3.metric("Net Profit", f"${net_profit:,.2f}", delta=f"{profit_margin:.1f}% Margin")
-    col4.metric("Est. Cash Balance", "$18,250.00", help="Previous Balance + Net Profit")
-
-    st.divider()
-
-    # --- CHARTS ---
-    c1, c2 = st.columns(2)
+    # --- DISPLAY ---
     
-    with c1:
-        st.subheader("💰 Income Sources")
-        st.bar_chart(df_revenue.groupby("Category")["Amount"].sum(), color="#4CAF50")
-        
-    with c2:
-        st.subheader("💸 Expense Breakdown")
-        if not df_expenses.empty:
-            st.bar_chart(df_expenses.groupby("Category")["Amount"].sum(), color="#FF4B4B")
-        else:
-            st.info("No expenses found.")
+    # Calculate Totals
+    total_rev = df_all[df_all['Flow'] == 'IN (Revenue)']['Amount'].sum()
+    total_exp = df_all[df_all['Flow'] == 'OUT (Expense)']['Amount'].sum()
+    net = total_rev - total_exp
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Revenue", f"${total_rev:,.2f}")
+    col2.metric("Total Expenses", f"${total_exp:,.2f}")
+    col3.metric("Net Profit", f"${net:,.2f}")
 
-    # --- DETAILED TABLE ---
-    st.subheader("📄 Transaction Ledger (All Activity)")
+    st.subheader("📋 Consolidated Ledger")
+    st.info("This table merges your Bank Feed (Plaid) with your Manual Sheet.")
     
-    if not df_expenses.empty:
-        df_combined = pd.concat([df_revenue, df_expenses])
-    else:
-        df_combined = df_revenue
-        
-    df_combined['Date'] = pd.to_datetime(df_combined['Date'])
-    df_combined = df_combined.sort_values(by="Date", ascending=False)
-    
-    # === THE FIX IS HERE ===
-    df_combined = df_combined.reset_index(drop=True)
-    # =======================
-    
-    def color_flow(val):
-        color = '#d1e7dd' if 'Revenue' in val else '#f8d7da'
-        return f'background-color: {color}; color: black'
-
     st.dataframe(
-        df_combined.style.applymap(color_flow, subset=['Flow']),
+        df_all[['Date', 'Description', 'Amount', 'Category', 'Source', 'Flow']],
         use_container_width=True,
-        column_config={
-            "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-            "Amount": st.column_config.NumberColumn("Amount", format="$%.2f")
-        },
         hide_index=True
     )
 
