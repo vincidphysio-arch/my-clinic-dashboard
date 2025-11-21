@@ -1,0 +1,4 @@
+streamlit
+pandas
+plaid-python
+python-dotenv
