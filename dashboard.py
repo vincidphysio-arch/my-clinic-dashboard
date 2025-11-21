@@ -33,12 +33,15 @@ PLAID_ENV = plaid.Environment.Sandbox
 
 @st.cache_resource
 def get_plaid_client():
-    configuration = plaid.Configuration(
-        host=PLAID_ENV,
-        api_key={'clientId': PLAID_CLIENT_ID, 'secret': PLAID_SECRET}
-    )
-    api_client = plaid.ApiClient(configuration)
-    return plaid_api.PlaidApi(api_client)
+    try:
+        configuration = plaid.Configuration(
+            host=PLAID_ENV,
+            api_key={'clientId': PLAID_CLIENT_ID, 'secret': PLAID_SECRET}
+        )
+        api_client = plaid.ApiClient(configuration)
+        return plaid_api.PlaidApi(api_client)
+    except:
+        return None
 
 @st.cache_data(ttl=60)
 def get_google_sheet_data():
@@ -51,7 +54,6 @@ def get_google_sheet_data():
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             
-            # OPEN THE SHEET (Ensure your Google Sheet is named exactly this)
             sheet = client.open("Clinic Expenses").sheet1
             data = sheet.get_all_records()
             return pd.DataFrame(data)
@@ -78,40 +80,50 @@ def main():
     # --- 1. GET PLAID DATA (Bank) ---
     plaid_client = get_plaid_client()
     plaid_data = []
-    try:
-        request = TransactionsSyncRequest(access_token=ACCESS_TOKEN)
-        response = plaid_client.transactions_sync(request)
-        for t in response['added']:
-            plaid_data.append({
-                "Date": pd.to_datetime(t['date']).date(),
-                "Description": t['name'],
-                "Amount": t['amount'],
-                "Category": clean_expense_category(t['name']),
-                "Source": "Bank Feed (Plaid)",
-                "Flow": "OUT (Expense)",
-                "Receipt": None  # No receipts for bank yet
-            })
-    except:
-        st.error("Plaid Error. Check Secrets.")
+    if plaid_client:
+        try:
+            request = TransactionsSyncRequest(access_token=ACCESS_TOKEN)
+            response = plaid_client.transactions_sync(request)
+            for t in response['added']:
+                plaid_data.append({
+                    "Date": pd.to_datetime(t['date']).date(),
+                    "Description": t['name'],
+                    "Amount": t['amount'],
+                    "Category": clean_expense_category(t['name']),
+                    "Source": "Bank Feed (Plaid)",
+                    "Flow": "OUT (Expense)",
+                    "Receipt": None
+                })
+        except:
+            st.error("Plaid Error. Check Secrets.")
 
     # --- 2. GET GOOGLE SHEET DATA (Manual) ---
     sheet_df = get_google_sheet_data()
     sheet_data = []
     if not sheet_df.empty:
         for index, row in sheet_df.iterrows():
+            # A. Fix Dates
             try:
                 d = pd.to_datetime(row['Date']).date()
             except:
                 d = datetime.now().date()
             
-            # SAFE GET: Checks if 'receipts' column exists, otherwise is None
+            # B. Fix Amounts (CRASH PROOFING IS HERE)
+            try:
+                # Remove $ signs, commas, and spaces
+                raw_amt = str(row['Amount']).replace('$', '').replace(',', '').strip()
+                final_amt = float(raw_amt) if raw_amt else 0.0
+            except:
+                final_amt = 0.0 # Default to 0 if it's bad text
+
+            # C. Fix Receipts
             receipt_link = row.get('receipts', None) 
             if receipt_link == "": receipt_link = None
 
             sheet_data.append({
                 "Date": d,
                 "Description": row['Description'],
-                "Amount": float(row['Amount']),
+                "Amount": final_amt,
                 "Category": row['Category'],
                 "Source": "Google Sheet",
                 "Flow": "OUT (Expense)",
@@ -141,17 +153,15 @@ def main():
     df_sheet = pd.DataFrame(sheet_data)
     df_rev = pd.DataFrame(rev_data)
     
-    # Check if empty before concat
     dfs_to_merge = [df for df in [df_plaid, df_sheet, df_rev] if not df.empty]
     if dfs_to_merge:
         df_all = pd.concat(dfs_to_merge).reset_index(drop=True)
         df_all['Date'] = pd.to_datetime(df_all['Date'])
         df_all = df_all.sort_values(by="Date", ascending=False)
     else:
-        st.stop() # Stop if no data
+        st.stop()
 
     # --- DISPLAY ---
-    
     total_rev = df_all[df_all['Flow'] == 'IN (Revenue)']['Amount'].sum()
     total_exp = df_all[df_all['Flow'] == 'OUT (Expense)']['Amount'].sum()
     net = total_rev - total_exp
@@ -162,7 +172,6 @@ def main():
     col3.metric("Net Profit", f"${net:,.2f}")
 
     st.subheader("📋 Consolidated Ledger")
-    st.info("Transactions from Plaid, Simulator, and Google Sheets.")
     
     st.dataframe(
         df_all[['Date', 'Description', 'Amount', 'Category', 'Source', 'Flow', 'Receipt']],
